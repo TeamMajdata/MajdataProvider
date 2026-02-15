@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,22 +27,37 @@ func buildManifest(root string) error {
 		return fmt.Errorf("charts is not a directory")
 	}
 
-	entries, err := os.ReadDir(chartsDir)
-	if err != nil {
-		return err
-	}
-
 	manifest := struct {
 		Charts []ParsedChart `json:"charts"`
 	}{
 		Charts: []ParsedChart{},
 	}
 
-	dirNames := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			dirNames = append(dirNames, entry.Name())
+	candidateFolders := []string{}
+	err = filepath.WalkDir(chartsDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
+		if d.IsDir() {
+			return nil
+		}
+		if d.Name() != "maidata.txt" {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		rel, err := filepath.Rel(chartsDir, dir)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "." {
+			return nil
+		}
+		candidateFolders = append(candidateFolders, rel)
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	type chartResult struct {
@@ -54,10 +70,10 @@ func buildManifest(root string) error {
 		workerLimit = 1
 	}
 	sem := make(chan struct{}, workerLimit)
-	results := make(chan chartResult, len(dirNames))
+	results := make(chan chartResult, len(candidateFolders))
 	var wg sync.WaitGroup
 
-	for _, folderName := range dirNames {
+	for _, folderName := range candidateFolders {
 		wg.Add(1)
 		go func(folder string) {
 			defer wg.Done()
@@ -89,20 +105,39 @@ func buildManifest(root string) error {
 		}(folderName)
 	}
 
-	wg.Wait()
-	for i := 0; i < len(dirNames); i++ {
-		result := <-results
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	total := len(candidateFolders)
+	loaded := 0
+	if total == 0 {
+		fmt.Print("\rCharts loaded: 0/0\n")
+	}
+	for result := range results {
+		loaded++
+		fmt.Printf("\rLoading charts: %d/%d", loaded, total)
 		if result.err != nil {
+			fmt.Println()
 			return result.err
 		}
 		manifest.Charts = append(manifest.Charts, result.chart)
+	}
+	if total > 0 {
+		fmt.Printf("\rCharts loaded: %d/%d\n", loaded, total)
 	}
 
 	out, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(root, "manifest.json"), out, 0o644)
+	manifestPath := filepath.Join(root, "manifest.json")
+	if err := os.WriteFile(manifestPath, out, 0o644); err != nil {
+		return err
+	}
+	log.Printf("build path=%s file=%s", manifestPath, "manifest.json")
+	return nil
 }
 
 func chartIDForFolder(folder string) string {

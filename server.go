@@ -14,10 +14,34 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/image/draw"
 )
+
+const (
+	chartAPIPrefix    = "/api/maichart/"
+	weekCacheControl  = "public,max-age=604800"
+	maxThumbnailPixel = 512
+)
+
+type chartAssetRequest struct {
+	folder string
+	asset  string
+}
+
+func logServe(path, file, extra string) {
+	if extra == "" {
+		log.Printf("serve path=%s file=%s", path, file)
+		return
+	}
+	log.Printf("serve path=%s file=%s %s", path, file, extra)
+}
+
+func logServeError(path string, err error) {
+	log.Printf("serve_error path=%s err=%v", path, err)
+}
 
 func serveChartList(root string) http.HandlerFunc {
 	manifestPath := filepath.Join(root, "manifest.json")
@@ -44,6 +68,7 @@ func serveChartList(root string) http.HandlerFunc {
 			http.Error(w, "failed to write response", http.StatusInternalServerError)
 			return
 		}
+		logServe(manifestPath, filepath.Base(manifestPath), "")
 	}
 }
 
@@ -52,72 +77,107 @@ func folderForChartID(chartID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	folder := string(folderBytes)
-	if folder == "" {
+	folder := filepath.Clean(filepath.FromSlash(string(folderBytes)))
+	if folder == "." || folder == "" {
 		return "", fmt.Errorf("empty folder name")
 	}
-	if strings.Contains(folder, "/") || strings.Contains(folder, "\\") || strings.Contains(folder, "..") {
+	if filepath.IsAbs(folder) || folder == ".." || strings.HasPrefix(folder, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid folder name")
 	}
 	return folder, nil
 }
 
+func parseChartAssetRequest(path string) (chartAssetRequest, error) {
+	if !strings.HasPrefix(path, chartAPIPrefix) {
+		return chartAssetRequest{}, fmt.Errorf("invalid api prefix")
+	}
+	rest := strings.TrimPrefix(path, chartAPIPrefix)
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return chartAssetRequest{}, fmt.Errorf("invalid api path")
+	}
+	folder, err := folderForChartID(parts[0])
+	if err != nil {
+		return chartAssetRequest{}, err
+	}
+	return chartAssetRequest{
+		folder: folder,
+		asset:  parts[1],
+	}, nil
+}
+
 func serveChartFile(root string) http.HandlerFunc {
 	chartsDir := filepath.Join(root, "charts")
-	const prefix = "/api/maichart/"
 	return func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if !strings.HasPrefix(path, prefix) {
-			http.NotFound(w, r)
-			return
-		}
-		rest := strings.TrimPrefix(path, prefix)
-		parts := strings.Split(rest, "/")
-		if len(parts) != 2 {
-			http.NotFound(w, r)
-			return
-		}
-		folder, err := folderForChartID(parts[0])
+		req, err := parseChartAssetRequest(r.URL.Path)
 		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
-		asset := parts[1]
-		switch asset {
+
+		switch req.asset {
 		case "chart":
-			maidataPath := filepath.Join(chartsDir, folder, "maidata.txt")
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			if err := serveFileWithHash(w, maidataPath, "text/plain; charset=utf-8"); err != nil {
+			maidataPath := filepath.Join(chartsDir, req.folder, "maidata.txt")
+			if err := serveFileWithHash(w, maidataPath, "text/plain; charset=utf-8", "maidata.txt", ""); err != nil {
 				http.NotFound(w, r)
 			}
 		case "track":
-			serveFirstExisting(w, r, chartsDir, folder, []string{"track.mp3", "track.ogg"})
+			serveChartTrack(w, r, chartsDir, req.folder)
 		case "image":
-			fullImage := r.URL.Query().Get("fullImage") == "true"
-			serveChartImage(w, r, chartsDir, folder, fullImage)
+			fullImage := parseFullImageQuery(r.URL.Query())
+			serveChartImage(w, r, chartsDir, req.folder, fullImage)
 		case "video":
-			serveFirstExisting(w, r, chartsDir, folder, []string{"pv.mp4", "pv.webm"})
+			serveChartVideo(w, r, chartsDir, req.folder)
 		default:
 			http.NotFound(w, r)
 		}
 	}
 }
 
-func serveFirstExisting(w http.ResponseWriter, r *http.Request, chartsDir, folder string, candidates []string) {
-	for _, name := range candidates {
-		path := filepath.Join(chartsDir, folder, name)
-		info, err := os.Stat(path)
-		if err != nil || info.IsDir() {
-			continue
-		}
-		ext := filepath.Ext(path)
-		contentType := mime.TypeByExtension(ext)
-		if err := serveFileWithHash(w, path, contentType); err != nil {
-			log.Printf("failed to serve file %s: %v", path, err)
-		}
+func parseFullImageQuery(values map[string][]string) bool {
+	v, ok := values["fullimage"]
+	if !ok || len(v) == 0 {
+		return false
+	}
+	return v[0] == "true"
+}
+
+func serveChartTrack(w http.ResponseWriter, r *http.Request, chartsDir, folder string) {
+	trackPath, err := firstExistingPath(chartsDir, folder, []string{"track.mp3"})
+	if err != nil {
+		http.NotFound(w, r)
 		return
 	}
-	http.NotFound(w, r)
+	if err := serveMediaFileWithHash(w, trackPath, "audio/mp3", "track.mp3"); err != nil {
+		logServeError(trackPath, err)
+	}
+}
+
+func serveChartVideo(w http.ResponseWriter, r *http.Request, chartsDir, folder string) {
+	videoPath, err := firstExistingPath(chartsDir, folder, []string{"bg.mp4", "pv.mp4"})
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := serveMediaFileWithHash(w, videoPath, "video/mp4", "bg.mp4"); err != nil {
+		logServeError(videoPath, err)
+	}
+}
+
+func serveMediaFileWithHash(w http.ResponseWriter, path, contentType, downloadName string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", downloadName))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", weekCacheControl)
+	if err := writeHashedBody(w, data); err != nil {
+		return err
+	}
+	logServe(path, downloadName, "")
+	return nil
 }
 
 func serveChartImage(w http.ResponseWriter, r *http.Request, chartsDir, folder string, fullImage bool) {
@@ -126,11 +186,12 @@ func serveChartImage(w http.ResponseWriter, r *http.Request, chartsDir, folder s
 		http.NotFound(w, r)
 		return
 	}
+	logExtra := fmt.Sprintf("fullImage=%t", fullImage)
 	if fullImage {
 		ext := filepath.Ext(fullPath)
 		contentType := mime.TypeByExtension(ext)
-		if err := serveFileWithHash(w, fullPath, contentType); err != nil {
-			log.Printf("failed to serve image %s: %v", fullPath, err)
+		if err := serveFileWithHash(w, fullPath, contentType, filepath.Base(fullPath), logExtra); err != nil {
+			logServeError(fullPath, err)
 		}
 		return
 	}
@@ -146,18 +207,10 @@ func serveChartImage(w http.ResponseWriter, r *http.Request, chartsDir, folder s
 		return
 	}
 
-	const maxDim = 512
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
-	newW, newH := resizeDimensions(width, height, maxDim)
-	if newW == width && newH == height {
-		contentType := mime.TypeByExtension(filepath.Ext(fullPath))
-		if err := serveDataWithHash(w, fullPath, data, contentType); err != nil {
-			log.Printf("failed to serve image %s: %v", fullPath, err)
-		}
-		return
-	}
+	newW, newH := resizeDimensions(width, height, maxThumbnailPixel)
 
 	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
@@ -181,8 +234,8 @@ func serveChartImage(w http.ResponseWriter, r *http.Request, chartsDir, folder s
 	if format == "png" {
 		contentType = "image/png"
 	}
-	if err := serveDataWithHash(w, fullPath+" (thumbnail)", out.Bytes(), contentType); err != nil {
-		log.Printf("failed to serve thumbnail %s: %v", fullPath, err)
+	if err := serveDataWithHash(w, fullPath, filepath.Base(fullPath), out.Bytes(), contentType, logExtra); err != nil {
+		logServeError(fullPath, err)
 	}
 }
 
@@ -217,28 +270,32 @@ func firstExistingPath(chartsDir, folder string, candidates []string) (string, e
 	return "", fmt.Errorf("no file found")
 }
 
-func serveFileWithHash(w http.ResponseWriter, path, contentType string) error {
+func serveFileWithHash(w http.ResponseWriter, path, contentType, downloadName, extra string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	return serveDataWithHash(w, filepath.Base(path), data, contentType)
+	return serveDataWithHash(w, path, downloadName, data, contentType, extra)
 }
 
-func serveDataWithHash(w http.ResponseWriter, filename string, data []byte, contentType string) error {
-	sum := sha256.Sum256(data)
+func serveDataWithHash(w http.ResponseWriter, path, downloadName string, data []byte, contentType, extra string) error {
 	if contentType != "" {
 		w.Header().Set("Content-Type", contentType)
 	}
-	if filename != "" {
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	if downloadName != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", downloadName))
 	}
-	hashValue := base64.StdEncoding.EncodeToString(sum[:])
-	w.Header().Set("hash", hashValue)
-	log.Printf("response headers for %s: %v", filename, w.Header())
-	n, err := w.Write(data)
-	if err == nil {
-		log.Printf("served %s bytes=%d hash=%s", filename, n, hashValue)
+	if err := writeHashedBody(w, data); err != nil {
+		return err
 	}
+	logServe(path, downloadName, extra)
+	return nil
+}
+
+func writeHashedBody(w http.ResponseWriter, data []byte) error {
+	sum := sha256.Sum256(data)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("hash", base64.StdEncoding.EncodeToString(sum[:]))
+	_, err := w.Write(data)
 	return err
 }
